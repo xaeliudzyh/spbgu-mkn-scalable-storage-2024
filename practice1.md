@@ -1,6 +1,6 @@
 # Практика 1
 
-![Saint-Petersburg](img/cover.png)
+![Saint-Petersburg](/img/cover.png)
 
 ## ТЗ
 
