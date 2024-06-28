@@ -1,6 +1,6 @@
 # Практика 1
 
-![Saint-Petersburg](/img/cover.png)
+![Saint-Petersburg](./img/cover.png)
 
 ## ТЗ
 
@@ -34,9 +34,10 @@
 ## API
 
 Апи возвращает:
-- 200 если всё ок
-- Индаче код ошибки и сообщение в body
+  - 200 если всё ок
+  - Индаче код ошибки и сообщение в body
 
+Http handlers:
 - `GET /*`
   - Вернуть ресурсы фронтенда из директории `front/dist/*`
 - `GET /select`
