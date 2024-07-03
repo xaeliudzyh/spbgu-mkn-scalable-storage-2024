@@ -17,8 +17,7 @@
 
 ## Backend
 
-- Взять подходящую библиотеку обработки GeoJSON данных
-- например, github.com/paulmach/orb/geojson
+- Взять библиотеку `github.com/paulmach/orb/geojson` обработки GeoJSON данных
 
 ## Сервис
 
