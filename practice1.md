@@ -33,6 +33,78 @@
 
 Для обработки GeoJSON данных возьмем библиотеку `github.com/paulmach/orb/geojson`
 
+## Сначала тестирование (тот самый TDD)
+
+## HTTP API
+
+- API возвращает:
+  - 200 если всё ок
+  - 407 для редиректа
+  - Иначе код ошибки и сообщение в body
+- `GET /select`
+  - После редиректов должно придти 200
+- `POST /insert` + объект в body
+  - После редиректов должно придти 200
+- `POST /replace` + объект в body
+  - После редиректов должно придти 200
+- `POST /delete` + объект в body с ID
+  - После редиректов должно придти 200
+
+### Тест для HTTP API
+
+Сделаем тест на вставку, замену и удаление данных.
+Чтобы написать тест, надо назвать файл так, чтобы он заканчивался на `_test.go`
+Для тестирования http запросов можно пользоваться объектами:
+- `http.NewRequest(...)` - для запроса
+- `httptest.NewRecorder(...)` — для записи ответа
+
+Например, сделаем `main_test.go`.
+```golang
+
+func TestSimple(t *testing.T) {
+	mux := http.NewServeMux()
+
+	s := NewStorage(mux, "test", []string{}, true)
+	go func() { s.Run() }()
+
+	r := NewRouter(mux, [][]string{{"test"}})
+	go func() { r.Run() }()
+	t.Cleanup(r.Stop)
+
+	t.Cleanup(s.Stop)
+
+	feature := geojson.NewFeature(orb.Point{rand.Float64(), rand.Float64()})
+	body, err := feature.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest("POST", "/insert", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code == http.StatusTemporaryRedirect {
+		req, err := http.NewRequest("POST", rr.Header().Get("location"), bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rr := httptest.NewRecorder()
+
+		mux.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
+		}
+	} else if rr.Code != http.StatusOK {
+		t.Errorf("handler returned wrong status code: got %v want %v", rr.Code, http.StatusOK)
+	}
+}
+```
+
+Для удобного создания большого количества тестов можно воспользоваться табличными шаблоном тестирования.
+https://go.dev/wiki/TableDrivenTests
+
 ## Наносервис
 
 Скелет наносервиса:
@@ -48,18 +120,22 @@ func (r *Router) Run() { }
 func (r *Router) Stop() { }
 ```
 
-Сделаем наносервис Router, который регистрирует в http.ServerMux
-Сделаем наносервис Storage, который регистрирует в http.ServerMux
+- Сделаем наносервис `Router`, который регистрирует свой HTTP API в `http.ServerMux`
+- Сделаем наносервис `Storage`, который регистрирует свой HTTP API в `http.ServerMux`
 
 Конструктор структуры Router:
 - `NewRouter(mux *http.ServeMux, nodes [][]string) *Router`
-  - `mux`
+  - `mux` роутер http запросов
+  - `nodes` список `Storage` узлов, пока что только один узел будет
 
 Конструктор структуры Storage:
 - `NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage`
+  - `mux` роутер http запросов
+  - `name` имя данного `Storage` узла
+  - `replicas` на будущее
+  - `leader` на будущее
 
 Расположим в структурах методы обработчики `http api`.
-
 Организовать наносервисы следующим образом.
 - Сделаем глобальный объект `mux *http.ServerMux`
 - Передадим объект и в конструктор `Router` и в конструктор `Storage`
@@ -72,10 +148,10 @@ func (r *Router) Stop() { }
 - Запустим ожидание сигнала
   ```
   sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigChan
-	slog.Info("got", "signal", sig)
-	```
+  signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+  sig := <-sigChan
+  slog.Info("got", "signal", sig)
+  ```
 - После получения сигнала остановим сервисы в обратном порядке
   - `http.Server`
   - `Router`
@@ -85,6 +161,7 @@ func (r *Router) Stop() { }
 
 API возвращает:
   - 200 если всё ок
+  - 407 для редиректа
   - Иначе код ошибки и сообщение в body
 
 ### Router
@@ -112,11 +189,3 @@ HTTP endpoints:
   - Заменить сохранённый ранее `geojson` объект из `body` запроса
 - `POST {name}/delete`
   - Удалить сохранённый ранее `geojson` объект `id` из `body` запроса
-
-## Тестирование
-
-Сделаем тест на вставку, замену и удаление данных.
-Для тестов можно воспользоваться табличными тестами.
-Для тестирования http запросов можно пользоваться объектами:
-- `http.NewRequest(...)` - для запроса
-- `httptest.NewRecorder(...)` — для записи ответа
