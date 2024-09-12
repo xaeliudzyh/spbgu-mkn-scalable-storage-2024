@@ -24,6 +24,18 @@
 - backend: golang
 - frontend: готовый проект на openlayers
 
+## Подготовка
+
+- В директории курса
+
+```
+mkdir practice1
+cd practice1
+go mod init practice1
+cd ..
+go work use practice1
+```
+
 ## Backend
 
 Реализуем три части.
