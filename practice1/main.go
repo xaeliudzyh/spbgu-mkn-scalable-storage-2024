@@ -2,11 +2,8 @@ package practice1
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"github.com/paulmach/orb/geojson"
-	"io/ioutil"
-	"log/slog"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,10 +14,11 @@ import (
 type Router struct {
 	mux   *http.ServeMux
 	nodes [][]string
+	stop  chan struct{} // канал для остановки роутера
 }
 
 func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
-	r := &Router{mux: mux, nodes: nodes}
+	r := &Router{mux: mux, nodes: nodes, stop: make(chan struct{})}
 
 	mux.Handle("/", http.FileServer(http.Dir("../front/dist")))
 	mux.Handle("/select", http.RedirectHandler("/storage/select", http.StatusTemporaryRedirect))
@@ -30,17 +28,29 @@ func NewRouter(mux *http.ServeMux, nodes [][]string) *Router {
 	return r
 }
 
+// Run запускает сервис Router
 func (r *Router) Run() {
+	r.stop = make(chan struct{}) // создаём канал для остановки
+	go func() {
+		<-r.stop
+	}()
 
+	log.Println("Router запущен") // логируем запуск сервиса
 }
 
+// Stop останавливает сервис Router
 func (r *Router) Stop() {
-
+	// Отправляем сигнал для завершения работы через канал
+	if r.stop != nil {
+		close(r.stop)                    // Закрываем только если канал был инициализирован
+		log.Println("Router остановлен") // логируем остановку сервиса
+	}
 }
 
 type Storage struct {
-	mux  *http.ServeMux // маршрутизатор для регистрации обработчиков запросов
-	name string         // Имя данного узла хранения данных
+	mux  *http.ServeMux
+	name string
+	stop chan struct{} // канал для остановки сервиса
 }
 
 func NewStorage(mux *http.ServeMux, name string, replicas []string) *Storage {
@@ -49,97 +59,93 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string) *Storage {
 		name: name,
 	}
 
-	// Хэндлер для обработки GET-запроса на селект - возвращает данные из базы в формате JSON
+	// Хэндлер для обработки запроса select, возвращает пустой geojson объект FeatureCollection
 	mux.HandleFunc("/"+name+"/select", func(w http.ResponseWriter, r *http.Request) {
-		data, _ := ioutil.ReadFile("geo.db.json")
+		data := []byte(`{"type": "FeatureCollection", "features": []}`)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(data)
 	})
 
-	// Хэндлер для обработки POST-запроса на инсерт - принимает GeoJSON объект в теле запроса и добавляет его в базу данных
+	// Хэндлер для обработки запроса insert, возвращает OK без body
 	mux.HandleFunc("/"+name+"/insert", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := ioutil.ReadAll(r.Body)
-		feature, _ := geojson.UnmarshalFeature(body)
-		data, _ := ioutil.ReadFile("geo.db.json")
-		collection, _ := geojson.UnmarshalFeatureCollection(data)
-		collection.Append(feature)
-		newData, _ := json.Marshal(collection)
-		ioutil.WriteFile("geo.db.json", newData, 0644)
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Хэндлер для обработки POST-запроса на замену объекта - принимает GeoJSON объект и заменяет существующий с таким же ID
+	// Хэндлер для обработки запроса replace, возвращает OK без body
 	mux.HandleFunc("/"+name+"/replace", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := ioutil.ReadAll(r.Body)
-		feature, _ := geojson.UnmarshalFeature(body)
-		data, _ := ioutil.ReadFile("geo.db.json")
-		collection, _ := geojson.UnmarshalFeatureCollection(data)
-		for i, f := range collection.Features {
-			if f.ID == feature.ID {
-				collection.Features[i] = feature
-				break
-			}
-		}
-		newData, _ := json.Marshal(collection)
-		ioutil.WriteFile("geo.db.json", newData, 0644)
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// Хэндлер для обработки POST-запроса на удаление - принимает GeoJSON объект с ID и удаляет его из базы данных
+	// Хэндлер для обработки запроса delete, возвращает OK без body
 	mux.HandleFunc("/"+name+"/delete", func(w http.ResponseWriter, r *http.Request) {
-		body, _ := ioutil.ReadAll(r.Body)
-		feature, _ := geojson.UnmarshalFeature(body)
-		data, _ := ioutil.ReadFile("geo.db.json")
-		collection, _ := geojson.UnmarshalFeatureCollection(data)
-		for i, f := range collection.Features {
-			if f.ID == feature.ID {
-				collection.Features = append(collection.Features[:i], collection.Features[i+1:]...)
-				break
-			}
-		}
-		newData, _ := json.Marshal(collection)
-		ioutil.WriteFile("geo.db.json", newData, 0644)
 		w.WriteHeader(http.StatusOK)
 	})
 
 	return s
 }
 
-func (r *Storage) Run() {
+// Run запускает Storage сервис
+func (s *Storage) Run() {
+	s.stop = make(chan struct{}) // создаём канал для остановки
 
+	// Запускаем сервис в горутине
+	go func() {
+		<-s.stop
+	}()
+
+	log.Printf("Storage '%s' запущен", s.name) // логируем запуск сервиса
 }
 
-func (r *Storage) Stop() {
-
+// Stop останавливает Storage сервис
+func (s *Storage) Stop() {
+	// Отправляем сигнал в канал для остановки работы
+	if s.stop != nil {
+		close(s.stop)
+		log.Printf("Storage '%s' остановлен", s.name) // логируем остановку сервиса
+	}
 }
 
 func main() {
 	r := http.ServeMux{}
-
-	router := NewRouter(&r)
+	nodes := [][]string{}
+	router := NewRouter(&r, nodes)
 	router.Run()
 
-	storage := NewStorage(&r, "storage")
+	storage := NewStorage(&r, "storage", nil)
 	storage.Run()
 
-	l := http.Server{}
-	l.Addr = "127.0.0.1:8080"
-	l.Handler = &r
+	// Настраиваем HTTP сервер
+	server := &http.Server{
+		Addr:    "127.0.0.1:8080",
+		Handler: &r,
+	}
 
+	// Канал для получения системных сигналов
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	// Запуск сервера в отдельной горутине
 	go func() {
-		sigs := make(chan os.Signal, 1)
-		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-		for _ = range sigs {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			l.Shutdown(ctx)
+		log.Printf("Server is listening on %s", server.Addr)
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("ListenAndServe error: %v", err)
 		}
 	}()
 
-	defer slog.Info("we are going down")
-	slog.Info("listen http://" + l.Addr)
-	err := l.ListenAndServe() // http event loop
-	if !errors.Is(err, http.ErrServerClosed) {
-		slog.Info("err", "err", err)
+	// Ожидание сигнала остановки
+	sig := <-sigs
+	log.Printf("Received signal: %v, shutting down server...", sig)
+
+	// Останавливаем сервер с таймаутом 5 секунд
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
 	}
+
+	router.Stop()
+	storage.Stop()
+
+	log.Println("Server stopped gracefully")
 }
