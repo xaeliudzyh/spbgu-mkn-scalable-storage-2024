@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/gorilla/websocket"
 	"github.com/paulmach/orb"
 	"github.com/paulmach/orb/geojson"
 	"github.com/tidwall/rtree"
@@ -14,8 +15,12 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
-	"time"
 )
+
+type Checkpoint struct {
+	Data   map[string]*geojson.Feature `json:"data"`
+	VClock map[string]uint64           `json:"vclock"`
+}
 
 type Transaction struct {
 	Action  string           `json:"action"`
@@ -46,6 +51,72 @@ type Engine struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	commands   chan Command
+
+	vclock   map[string]uint64
+	replicas []string
+	leader   bool
+	// Реестр подключенных реплик
+	replicaConns map[string]*websocket.Conn
+}
+
+func (e *Engine) applyTransaction(txn *Transaction) {
+	// Проверяем, применяли ли мы уже эту транзакцию
+	lastLSN, exists := e.vclock[txn.Name]
+	if exists && txn.LSN <= lastLSN {
+		return // Уже применили эту или более новую транзакцию от этого узла
+	}
+	// Обновляем vclock
+	e.vclock[txn.Name] = txn.LSN
+	// Применяем транзакцию
+	switch txn.Action {
+	case "insert", "replace":
+		idStr, ok := txn.Feature.ID.(string)
+		if !ok {
+			return
+		}
+		e.data[idStr] = txn.Feature
+		minX, minY, maxX, maxY := getBoundingBox(txn.Feature.Geometry)
+		e.spatialIdx.Insert([2]float64{minX, minY}, [2]float64{maxX, maxY}, txn.Feature)
+	case "delete":
+		idStr, ok := txn.Feature.ID.(string)
+		if !ok {
+			return
+		}
+		feature, exists := e.data[idStr]
+		if !exists {
+			return
+		}
+		minX, minY, maxX, maxY := getBoundingBox(feature.Geometry)
+		e.spatialIdx.Delete([2]float64{minX, minY}, [2]float64{maxX, maxY}, feature)
+		delete(e.data, idStr)
+	}
+}
+
+func (e *Engine) connectToReplicas() {
+	for _, addr := range e.replicas {
+		go func(addr string) {
+			// Установить соединение с репликой по WebSocket
+			conn, _, err := websocket.DefaultDialer.Dial("ws://"+addr+"/replication", nil)
+			if err != nil {
+				log.Printf("Ошибка подключения к реплике %s: %v", addr, err)
+				return
+			}
+			e.replicaConns[addr] = conn
+
+			// Слушаем входящие сообщения от реплики
+			for {
+				var txn Transaction
+				err := conn.ReadJSON(&txn)
+				if err != nil {
+					log.Printf("Ошибка чтения транзакции от реплики %s: %v", addr, err)
+					conn.Close()
+					delete(e.replicaConns, addr)
+					return
+				}
+				e.applyTransaction(&txn)
+			}
+		}(addr)
+	}
 }
 
 func (e *Engine) Run() {
@@ -57,8 +128,7 @@ func (e *Engine) Run() {
 		if err := e.replayTransactions(); err != nil {
 			log.Printf("Ошибка воспроизведения транзакций: %v", err)
 		}
-
-		// Основной цикл обработки команд
+		e.connectToReplicas()
 		for {
 			select {
 			case <-e.ctx.Done():
@@ -72,6 +142,17 @@ func (e *Engine) Run() {
 			}
 		}
 	}()
+}
+
+func (e *Engine) broadcastTransaction(txn *Transaction) {
+	for addr, conn := range e.replicaConns {
+		err := conn.WriteJSON(txn)
+		if err != nil {
+			log.Printf("Ошибка отправки транзакции на реплику %s: %v", addr, err)
+			conn.Close()
+			delete(e.replicaConns, addr)
+		}
+	}
 }
 
 func (e *Engine) handleCommand(cmd Command) {
@@ -89,9 +170,23 @@ func (e *Engine) handleCommand(cmd Command) {
 	default:
 		cmd.result <- errors.New("неизвестная команда: " + cmd.action)
 	}
+	if e.leader && cmd.action != "search" && cmd.action != "checkpoint" {
+		txn := Transaction{
+			Action:  cmd.action,
+			Name:    e.name,
+			LSN:     e.lsn,
+			Feature: cmd.feature,
+		}
+		e.broadcastTransaction(&txn)
+	}
 }
 
 func (e *Engine) handleInsert(cmd Command) {
+	if !e.leader {
+		cmd.result <- errors.New("только лидер может создавать новые транзакции")
+		return
+	}
+	e.lsn++
 	e.lsn++
 	txn := Transaction{
 		Action:  "insert",
@@ -117,6 +212,10 @@ func (e *Engine) handleInsert(cmd Command) {
 }
 
 func (e *Engine) handleReplace(cmd Command) {
+	if !e.leader {
+		cmd.result <- errors.New("только лидер может создавать новые транзакции")
+		return
+	}
 	e.lsn++
 	txn := Transaction{
 		Action:  "replace",
@@ -149,6 +248,10 @@ func (e *Engine) handleReplace(cmd Command) {
 }
 
 func (e *Engine) handleDelete(cmd Command) {
+	if !e.leader {
+		cmd.result <- errors.New("только лидер может создавать новые транзакции")
+		return
+	}
 	e.lsn++
 	txn := Transaction{
 		Action:  "delete",
@@ -199,6 +302,37 @@ func (e *Engine) handleSearch(cmd Command) {
 	cmd.searchResult <- SearchResult{Features: features, Error: nil}
 }
 
+var upgrader = websocket.Upgrader{}
+
+func (s *Storage) setupReplicationHandler() {
+	s.mux.HandleFunc("/"+s.name+"/replication", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("Ошибка апгрейда соединения: %v", err)
+			return
+		}
+		addr := conn.RemoteAddr().String()
+		s.engine.replicaConns[addr] = conn
+
+		// Слушаем входящие сообщения от реплики
+		go func() {
+			defer func() {
+				conn.Close()
+				delete(s.engine.replicaConns, addr)
+			}()
+			for {
+				var txn Transaction
+				err := conn.ReadJSON(&txn)
+				if err != nil {
+					log.Printf("Ошибка чтения транзакции от реплики %s: %v", addr, err)
+					return
+				}
+				s.engine.applyTransaction(&txn)
+			}
+		}()
+	})
+}
+
 func (e *Engine) logTransaction(txn *Transaction) error {
 	file, err := os.OpenFile("transactions.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -222,8 +356,13 @@ func (e *Engine) checkpoint() error {
 	}
 	defer file.Close()
 
+	checkpoint := Checkpoint{
+		Data:   e.data,
+		VClock: e.vclock,
+	}
+
 	encoder := json.NewEncoder(file)
-	err = encoder.Encode(e.data)
+	err = encoder.Encode(&checkpoint)
 	if err != nil {
 		return err
 	}
@@ -247,13 +386,16 @@ func (e *Engine) loadCheckpoint() error {
 	}
 	defer file.Close()
 
+	var checkpoint Checkpoint
+
 	decoder := json.NewDecoder(file)
-	err = decoder.Decode(&e.data)
+	err = decoder.Decode(&checkpoint)
 	if err != nil {
 		return err
 	}
 
-	// Восстановление пространственного индекса
+	e.data = checkpoint.Data
+	e.vclock = checkpoint.VClock
 	for _, feature := range e.data {
 		minX, minY, maxX, maxY := getBoundingBox(feature.Geometry)
 		e.spatialIdx.Insert([2]float64{minX, minY}, [2]float64{maxX, maxY}, feature)
@@ -279,32 +421,7 @@ func (e *Engine) replayTransactions() error {
 		if err != nil {
 			return err
 		}
-		if txn.LSN > e.lsn {
-			e.lsn = txn.LSN
-		}
-		// Применение транзакции
-		switch txn.Action {
-		case "insert", "replace":
-			idStr, ok := txn.Feature.ID.(string)
-			if !ok {
-				continue
-			}
-			e.data[idStr] = txn.Feature
-			minX, minY, maxX, maxY := getBoundingBox(txn.Feature.Geometry)
-			e.spatialIdx.Insert([2]float64{minX, minY}, [2]float64{maxX, maxY}, txn.Feature)
-		case "delete":
-			idStr, ok := txn.Feature.ID.(string)
-			if !ok {
-				continue
-			}
-			feature, exists := e.data[idStr]
-			if !exists {
-				continue
-			}
-			minX, minY, maxX, maxY := getBoundingBox(feature.Geometry)
-			e.spatialIdx.Delete([2]float64{minX, minY}, [2]float64{maxX, maxY}, feature)
-			delete(e.data, idStr)
-		}
+		e.applyTransaction(&txn)
 	}
 	return scanner.Err()
 }
@@ -354,32 +471,69 @@ func (r *Router) Stop() {
 }
 
 type Storage struct {
-	mux    *http.ServeMux
-	name   string
-	engine *Engine
-	stop   chan struct{}
+	mux          *http.ServeMux
+	name         string
+	engine       *Engine
+	stop         chan struct{}
+	requestCount int
+	requestLimit int
+	replicas     []string
 }
 
-func NewStorage(mux *http.ServeMux, name string, replicas []string) *Storage {
+func NewStorage(mux *http.ServeMux, name string, replicas []string, leader bool) *Storage {
 	ctx, cancel := context.WithCancel(context.Background())
 	engine := &Engine{
-		data:       make(map[string]*geojson.Feature),
-		spatialIdx: &rtree.RTree{},
-		lsn:        0,
-		name:       name,
-		ctx:        ctx,
-		cancel:     cancel,
-		commands:   make(chan Command),
+		data:         make(map[string]*geojson.Feature),
+		spatialIdx:   &rtree.RTree{},
+		lsn:          0,
+		name:         name,
+		ctx:          ctx,
+		cancel:       cancel,
+		commands:     make(chan Command),
+		vclock:       make(map[string]uint64),
+		replicas:     replicas,
+		leader:       leader,
+		replicaConns: make(map[string]*websocket.Conn),
 	}
 
 	s := &Storage{
-		mux:    mux,
-		name:   name,
-		engine: engine,
+		mux:          mux,
+		name:         name,
+		engine:       engine,
+		requestLimit: 3,        // Пороговое значение
+		replicas:     replicas, // Список реплик
 	}
 	s.engine.Run()
+	s.setupReplicationHandler()
 
 	mux.HandleFunc("/"+name+"/select", func(w http.ResponseWriter, r *http.Request) {
+		s.requestCount++
+
+		// Проверяем, не достигнут ли порог
+		if s.requestCount > s.requestLimit {
+			// Сбрасываем счётчик
+			s.requestCount = 0
+
+			// Получаем адрес реплики для редиректа
+			redirected := false
+			for _, replicaAddr := range s.replicas {
+				if replicaAddr != s.name {
+					// Проверяем, не было ли уже редиректа
+					if r.Header.Get("X-Redirected") == "true" {
+						http.Error(w, "Too many redirects", http.StatusInternalServerError)
+						return
+					}
+					// Добавляем заголовок
+					r.Header.Set("X-Redirected", "true")
+					http.Redirect(w, r, "http://"+replicaAddr+"/"+name+"/select"+r.URL.RawQuery, http.StatusTemporaryRedirect)
+					redirected = true
+					break
+				}
+			}
+			if redirected {
+				return
+			}
+		}
 		minX, err := strconv.ParseFloat(r.URL.Query().Get("minX"), 64)
 		if err != nil {
 			http.Error(w, "Invalid minX parameter", http.StatusBadRequest)
@@ -420,6 +574,7 @@ func NewStorage(mux *http.ServeMux, name string, replicas []string) *Storage {
 		if err := json.NewEncoder(w).Encode(fc); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
+		s.requestCount--
 	})
 
 	mux.HandleFunc("/"+name+"/insert", func(w http.ResponseWriter, r *http.Request) {
@@ -512,41 +667,34 @@ func (s *Storage) Stop() {
 }
 
 func main() {
-	r := http.ServeMux{}
-	nodes := [][]string{}
-	router := NewRouter(&r, nodes)
-	router.Run()
+	storage1Mux := http.NewServeMux()
+	storage1 := NewStorage(storage1Mux, "storage1", []string{"127.0.0.1:8081", "127.0.0.1:8082"}, true)
 
-	storage := NewStorage(&r, "storage", nil)
-	storage.Run()
+	storage2Mux := http.NewServeMux()
+	storage2 := NewStorage(storage2Mux, "storage2", []string{"127.0.0.1:8080", "127.0.0.1:8082"}, false)
 
-	// Настраиваем HTTP сервер
-	server := &http.Server{
-		Addr:    "127.0.0.1:8080",
-		Handler: &r,
-	}
-
+	storage3Mux := http.NewServeMux()
+	storage3 := NewStorage(storage3Mux, "storage3", []string{"127.0.0.1:8080", "127.0.0.1:8081"}, false)
+	go runStorage(storage1, storage1Mux, ":8080")
+	go runStorage(storage2, storage2Mux, ":8081")
+	go runStorage(storage3, storage3Mux, ":8082")
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	<-sigs
 
-	go func() {
-		log.Printf("Server is listening on %s", server.Addr)
-		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("ListenAndServe error: %v", err)
-		}
-	}()
-	sig := <-sigs
-	log.Printf("Received signal: %v, shutting down server...", sig)
+	storage1.Stop()
+	storage2.Stop()
+	storage3.Stop()
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+func runStorage(s *Storage, mux *http.ServeMux, addr string) {
+	s.Run()
+	server := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
-
-	router.Stop()
-	storage.Stop()
-
-	log.Println("Server stopped gracefully")
+	log.Printf("Storage '%s' is listening on %s", s.name, addr)
+	if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("ListenAndServe error: %v", err)
+	}
 }
